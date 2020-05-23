@@ -23,6 +23,7 @@ WITHWARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #include "Tiano/EfiTianoDecompress.h"
 #include "LZMA/LzmaCompress.h"
 #include "LZMA/LzmaDecompress.h"
+#include "LZMA/x86Convert.h"
 
 #ifdef _CONSOLE
 #include <iostream>
@@ -1555,6 +1556,22 @@ UINT8 FfsEngine::parseDepexSection(const QByteArray & body, QString & parsed)
     return ERR_SUCCESS;
 }
 
+UINT8 x86Convert(QByteArray & input, int mode) {
+    unsigned char* source = (unsigned char*)input.data();
+    UINT32 sourceSize = input.size();
+
+    UINT32 state;
+    x86_Convert_Init(state);
+    UINT32 converted = x86_Convert(source, sourceSize, 0, &state, mode);
+
+    const UINT8 x86LookAhead = 4;
+    if (converted + x86LookAhead != sourceSize) {
+        return ERR_INVALID_VOLUME;
+    }
+
+    return ERR_SUCCESS;
+}
+
 UINT8 FfsEngine::parseSection(const QByteArray & section, QModelIndex & index, const QModelIndex & parent, const UINT8 mode)
 {
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
@@ -1643,9 +1660,10 @@ UINT8 FfsEngine::parseSection(const QByteArray & section, QModelIndex & index, c
         UINT32 dictionarySize = DEFAULT_LZMA_DICTIONARY_SIZE;
 
         // Check if section requires processing
+        QByteArray parsedGuid = QByteArray((const char*)&guidDefinedSectionHeader->SectionDefinitionGuid, sizeof(EFI_GUID));
         if (guidDefinedSectionHeader->Attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) {
             // Tiano compressed section
-            if (QByteArray((const char*)&guidDefinedSectionHeader->SectionDefinitionGuid, sizeof(EFI_GUID)) == EFI_GUIDED_SECTION_TIANO) {
+            if (parsedGuid == EFI_GUIDED_SECTION_TIANO) {
                 algorithm = COMPRESSION_ALGORITHM_UNKNOWN;
 
                 result = decompress(body, EFI_STANDARD_COMPRESSION, processed, &algorithm);
@@ -1664,12 +1682,17 @@ UINT8 FfsEngine::parseSection(const QByteArray & section, QModelIndex & index, c
                     info += tr("\nCompression type: unknown");
             }
             // LZMA compressed section
-            else if (QByteArray((const char*)&guidDefinedSectionHeader->SectionDefinitionGuid, sizeof(EFI_GUID)) == EFI_GUIDED_SECTION_LZMA) {
+            else if (parsedGuid == EFI_GUIDED_SECTION_LZMA || parsedGuid == EFI_GUIDED_SECTION_LZMAF86) {
                 algorithm = COMPRESSION_ALGORITHM_UNKNOWN;
 
                 result = decompress(body, EFI_CUSTOMIZED_COMPRESSION, processed, &algorithm);
                 if (result)
                     parseCurrentSection = false;
+                if (parsedGuid == EFI_GUIDED_SECTION_LZMAF86) {
+                    if (x86Convert(processed, 0) != ERR_SUCCESS) {
+                        msg(tr("parseSection: unable to convert LZMAF86 compressed data"));
+                    }
+                }
 
                 if (algorithm == COMPRESSION_ALGORITHM_LZMA) {
                     info += tr("\nCompression type: LZMA");
@@ -1683,7 +1706,7 @@ UINT8 FfsEngine::parseSection(const QByteArray & section, QModelIndex & index, c
                     info += tr("\nCompression type: unknown");
             }
             // Signed section
-            else if (QByteArray((const char*)&guidDefinedSectionHeader->SectionDefinitionGuid, sizeof(EFI_GUID)) == EFI_FIRMWARE_CONTENTS_SIGNED_GUID) {
+            else if (parsedGuid == EFI_FIRMWARE_CONTENTS_SIGNED_GUID) {
                 msgSigned = true;
                 const WIN_CERTIFICATE* certificateHeader = (const WIN_CERTIFICATE*)body.constData();
                 if ((UINT32)body.size() < sizeof(WIN_CERTIFICATE)) {
@@ -1738,7 +1761,7 @@ UINT8 FfsEngine::parseSection(const QByteArray & section, QModelIndex & index, c
         else if (guidDefinedSectionHeader->Attributes & EFI_GUIDED_SECTION_AUTH_STATUS_VALID)
         {
             // CRC32 section
-            if (QByteArray((const char*)&guidDefinedSectionHeader->SectionDefinitionGuid, sizeof(EFI_GUID)) == EFI_GUIDED_SECTION_CRC32) {
+            if (parsedGuid == EFI_GUIDED_SECTION_CRC32) {
                 info += tr("\nChecksum type: CRC32");
                 // Calculate CRC32 of section data
                 UINT32 crc = crc32(0, (const UINT8*)body.constData(), body.size());
@@ -3032,7 +3055,7 @@ UINT8 FfsEngine::reconstructIntelImage(const QModelIndex& index, QByteArray& rec
     UINT8 result;
 
     // No action
-    if (model->action(index) == Actions::NoAction) {
+    if (model->action(index) == Actions::NoAction || model->action(index) == Actions::DoNotRebuild) {
         reconstructed = model->header(index).append(model->body(index));
         return ERR_SUCCESS;
     }
@@ -3219,7 +3242,7 @@ UINT8 FfsEngine::reconstructRegion(const QModelIndex& index, QByteArray& reconst
     UINT8 result;
 
     // No action
-    if (model->action(index) == Actions::NoAction) {
+    if (model->action(index) == Actions::NoAction || model->action(index) == Actions::DoNotRebuild) {
         reconstructed = model->header(index).append(model->body(index));
         return ERR_SUCCESS;
     }
@@ -3276,7 +3299,7 @@ UINT8 FfsEngine::reconstructPadding(const QModelIndex& index, QByteArray& recons
         return ERR_SUCCESS;
 
     // No action
-    if (model->action(index) == Actions::NoAction) {
+    if (model->action(index) == Actions::NoAction || model->action(index) == Actions::DoNotRebuild) {
         reconstructed = model->body(index);
         return ERR_SUCCESS;
     }
@@ -3321,7 +3344,7 @@ UINT8 FfsEngine::reconstructVolume(const QModelIndex & index, QByteArray & recon
     UINT8 result;
 
     // No action
-    if (model->action(index) == Actions::NoAction) {
+    if (model->action(index) == Actions::NoAction || model->action(index) == Actions::DoNotRebuild) {
         reconstructed = model->header(index).append(model->body(index));
         return ERR_SUCCESS;
     }
@@ -3467,14 +3490,18 @@ UINT8 FfsEngine::reconstructVolume(const QModelIndex & index, QByteArray & recon
                     if (fileHeader->Type == EFI_FV_FILETYPE_PAD) {
                         padFileGuid = file.left(sizeof(EFI_GUID));
 
+                        if (model->action(index.child(i, 0)) == Actions::DoNotRebuild) {
+                            // User asked not to touch this file, do nothing here
+                        }
                         // Parse non-empty pad file
-                        if (model->rowCount(index.child(i, 0))) {
-                            //TODO: handle it
+                        else if (model->rowCount(index.child(i, 0))) {
+                            // TODO: handle this special case
                             continue;
                         }
                         // Skip empty pad-file
-                        else
+                        else {
                             continue;
+                        }
                     }
 
                     // Volume Top File
@@ -3691,7 +3718,7 @@ UINT8 FfsEngine::reconstructFile(const QModelIndex& index, const UINT8 revision,
     UINT8 result;
 
     // No action
-    if (model->action(index) == Actions::NoAction) {
+    if (model->action(index) == Actions::NoAction || model->action(index) == Actions::DoNotRebuild) {
         reconstructed = model->header(index).append(model->body(index));
         const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)model->header(index).constData();
         // Append tail, if needed
@@ -3881,7 +3908,7 @@ UINT8 FfsEngine::reconstructSection(const QModelIndex& index, const UINT32 base,
     UINT8 result;
 
     // No action
-    if (model->action(index) == Actions::NoAction) {
+    if (model->action(index) == Actions::NoAction || model->action(index) == Actions::DoNotRebuild) {
         reconstructed = model->header(index).append(model->body(index));
         return ERR_SUCCESS;
     }
@@ -3966,6 +3993,12 @@ UINT8 FfsEngine::reconstructSection(const QModelIndex& index, const UINT32 base,
             }
             else if (model->subtype(index) == EFI_SECTION_GUID_DEFINED) {
                 EFI_GUID_DEFINED_SECTION* guidDefinedHeader = (EFI_GUID_DEFINED_SECTION*)header.data();
+                // Convert x86
+                if (QByteArray((const char*)&guidDefinedHeader->SectionDefinitionGuid, sizeof(EFI_GUID)) == EFI_GUIDED_SECTION_LZMAF86) {
+                    result = x86Convert(reconstructed, 1);
+                    if (result)
+                        return result;
+                }
                 // Compress new section body
                 QByteArray compressed;
                 result = compress(reconstructed, model->compression(index), model->dictionarySize(index), compressed);
